@@ -1,0 +1,18 @@
+# Roblox build output
+*.rbxlx
+*.rbxl
+*.rbxm
+*.rbxmx
+
+# Tool managers
+/bin/
+~/.aftman/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Wally packages
+/Packages/
+/DevPackages/
+/wally.lock
