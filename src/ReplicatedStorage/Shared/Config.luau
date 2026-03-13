@@ -79,6 +79,18 @@ Config.ITEMS = {
 	CookedMeat = { displayName = "Cooked Meat", stackSize = 10, category = "Food", hungerRestore = 25 },
 	SkipperHide = { displayName = "Skipper Hide", stackSize = 10, category = "Resource" },
 	ProwlerHide = { displayName = "Prowler Hide", stackSize = 10, category = "Resource" },
+
+	-- Crafted items
+	WoodenBarricade = { displayName = "Wooden Barricade", stackSize = 5, category = "Placeable" },
+	Bedroll = { displayName = "Bedroll", stackSize = 1, category = "Placeable" },
+	BearTrap = { displayName = "Bear Trap", stackSize = 5, category = "Placeable", damage = 30 },
+	ReinforcedWall = { displayName = "Reinforced Wall", stackSize = 5, category = "Placeable" },
+	Crossbow = { displayName = "Crossbow", stackSize = 1, category = "Tool", damage = 20 },
+	UpgradedPack = { displayName = "Upgraded Pack", stackSize = 1, category = "Tool" },
+	Medkit = { displayName = "Medkit", stackSize = 5, category = "Consumable", healAmount = 40 },
+	AlloyWall = { displayName = "Alloy Wall", stackSize = 5, category = "Placeable" },
+	PulseBow = { displayName = "Pulse Bow", stackSize = 1, category = "Tool", damage = 35 },
+	ExoArmor = { displayName = "Exo-Armor", stackSize = 1, category = "Tool", damageReduction = 0.3 },
 }
 
 -- Combat

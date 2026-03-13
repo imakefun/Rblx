@@ -204,8 +204,8 @@ function SignalFireManager.update(dt: number)
 end
 
 function SignalFireManager.addFuel(amount: number)
-	state.fuel = math.min(state.maxFuel, state.fuel + amount)
-	print("[SignalFireManager] Fuel added. Current:", math.floor(state.fuel))
+	state.fuel = math.clamp(state.fuel + amount, 0, state.maxFuel)
+	print("[SignalFireManager] Fuel changed by", math.floor(amount), "- Current:", math.floor(state.fuel))
 end
 
 function SignalFireManager.upgradeLevel()

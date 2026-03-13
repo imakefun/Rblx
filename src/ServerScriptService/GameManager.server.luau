@@ -1,13 +1,13 @@
 --!strict
 -- GameManager.server.luau
 -- Master game loop: coordinates all server systems, manages the sol cycle,
--- and runs the Heartbeat tick for stats/fire/lighting.
+-- and runs the Heartbeat tick for stats/fire/lighting/combat/AI/raids.
 --
 -- This is a Script (not a ModuleScript) so it auto-runs on the server.
 -- It requires all manager modules and wires them together.
 --
 -- Architecture:
---   GameManager (this file) is the ONLY server Script.
+--   GameManager (this file) is the ONLY server Script (besides MapSetup).
 --   Everything else is a ModuleScript that exposes Init/Start/Update functions.
 --   This keeps the boot order explicit and avoids hidden require chains.
 --
@@ -28,6 +28,12 @@ local DayNightCycle = require(ServerScriptService:WaitForChild("DayNightCycle"))
 local PlayerManager = require(ServerScriptService:WaitForChild("PlayerManager"))
 local SignalFireManager = require(ServerScriptService:WaitForChild("SignalFireManager"))
 local InventoryManager = require(ServerScriptService:WaitForChild("InventoryManager"))
+local CraftingManager = require(ServerScriptService:WaitForChild("CraftingManager"))
+local CombatManager = require(ServerScriptService:WaitForChild("CombatManager"))
+local StalkerAI = require(ServerScriptService:WaitForChild("StalkerAI"))
+local RaidManager = require(ServerScriptService:WaitForChild("RaidManager"))
+local ShipPartManager = require(ServerScriptService:WaitForChild("ShipPartManager"))
+local PickupManager = require(ServerScriptService:WaitForChild("PickupManager"))
 
 -------------------------------------------------------------------------------
 -- Game state
@@ -53,6 +59,11 @@ DayNightCycle.OnSolChanged(function(sol: number)
 
 	NetworkManager.FireAllClients("SolUpdated", sol)
 
+	-- Check for Kethari raid trigger
+	if RaidManager.ShouldRaid(sol) then
+		RaidManager.StartRaid(sol, SignalFireManager.getPosition())
+	end
+
 	-- Victory check
 	if sol > Config.MAX_SOL then
 		NetworkManager.FireAllClients("Notify", "Victory", `You survived all {Config.MAX_SOL} sols!`)
@@ -63,6 +74,34 @@ end)
 DayNightCycle.OnNightChanged(function(isNight: boolean)
 	local phase = if isNight then "Night" else "Day"
 	NetworkManager.FireAllClients("TimePhaseChanged", phase, DayNightCycle.GetSol())
+
+	-- Notify Stalker AI of night state change
+	StalkerAI.SetNight(isNight)
+end)
+
+-------------------------------------------------------------------------------
+-- Wire combat kill callbacks to loot systems
+-------------------------------------------------------------------------------
+
+CombatManager.OnNPCKilled(function(npc: Model, npcType: string, killer: Player)
+	if npcType == "Stalker" then
+		StalkerAI.OnStalkerKilled(npc, killer)
+	elseif npcType == "KethariMelee" or npcType == "KethariRanged" then
+		RaidManager.OnKethariKilled(npc, killer)
+	end
+end)
+
+-- Wire raid fire attacks to reduce signal fire fuel
+RaidManager.OnFireAttacked(function(damage: number)
+	-- Raids drain fuel from the fire (1 fuel per damage point)
+	local fuelDrain = damage * 0.5
+	local state = SignalFireManager.getState()
+	if state.fuel > 0 then
+		-- We subtract by adding negative (addFuel clamps to max, so we use direct method)
+		-- Actually, let's just call update manually -- or we add a drain function
+		-- For now, we access the state through a simple approach
+		SignalFireManager.addFuel(-fuelDrain)
+	end
 end)
 
 -------------------------------------------------------------------------------
@@ -81,7 +120,6 @@ NetworkManager.OnClientEvent("AddFuel", function(player: Player, itemId: any)
 
 	SignalFireManager.addFuel(fuelValue)
 
-	-- Send updated inventory to the player
 	local inv = PlayerManager.getInventory(player)
 	if inv then
 		NetworkManager.FireClient(player, "InventoryUpdated", inv)
@@ -151,11 +189,23 @@ NetworkManager.OnClientEvent("GatherResource", function(player: Player, targetNa
 		target.CanCollide = false
 		target:SetAttribute("Depleted", true)
 
+		-- Also hide leaves for trees
+		for _, child in target:GetChildren() do
+			if child:IsA("BasePart") then
+				child.Transparency = 1
+			end
+		end
+
 		task.delay(Config.RESOURCE_RESPAWN_TIME, function()
 			if target and target.Parent then
 				target.Transparency = 0
 				target.CanCollide = true
 				target:SetAttribute("Depleted", false)
+				for _, child in target:GetChildren() do
+					if child:IsA("BasePart") then
+						child.Transparency = 0
+					end
+				end
 				if resourceType == "Tree" then
 					target:SetAttribute("HitsLeft", Config.TREE_HITS)
 				elseif resourceType == "Rock" then
@@ -176,8 +226,6 @@ end)
 -- Sprint toggle
 NetworkManager.OnClientEvent("SetSprinting", function(player: Player, sprinting: any)
 	if typeof(sprinting) ~= "boolean" then return end
-	-- Actual stamina drain happens in the Heartbeat tick via setSprint
-	-- Here we just record the intent
 	PlayerManager.setSprint(player, sprinting, 0)
 end)
 
@@ -187,10 +235,13 @@ NetworkManager.OnClientInvoke("GetMyStats", function(player: Player)
 end)
 
 -------------------------------------------------------------------------------
--- Register InventoryManager network handlers (equip, unequip, use, drop)
+-- Register sub-system network handlers
 -------------------------------------------------------------------------------
 
 InventoryManager.RegisterNetworkHandlers()
+CraftingManager.RegisterNetworkHandlers()
+CombatManager.RegisterNetworkHandlers()
+ShipPartManager.RegisterNetworkHandlers()
 
 -------------------------------------------------------------------------------
 -- Player lifecycle
@@ -213,6 +264,8 @@ end)
 
 Players.PlayerRemoving:Connect(function(player: Player)
 	InventoryManager.OnPlayerRemoving(player)
+	CraftingManager.OnPlayerRemoving(player)
+	CombatManager.OnPlayerRemoving(player)
 	PlayerManager.cleanupPlayer(player)
 end)
 
@@ -229,6 +282,10 @@ end
 
 SignalFireManager.init()
 DayNightCycle.Init()
+StalkerAI.Init()
+RaidManager.Init()
+PickupManager.Init()
+ShipPartManager.Init(SignalFireManager.getPosition())
 
 -------------------------------------------------------------------------------
 -- Main Heartbeat loop
@@ -249,7 +306,16 @@ RunService.Heartbeat:Connect(function(dt: number)
 	-- 3. Broadcast signal fire state (using unreliable for high-frequency updates)
 	NetworkManager.FireAllClientsUnreliable("SignalFireUpdated", SignalFireManager.getState())
 
-	-- 4. Tick each player's stats
+	-- 4. Update AI systems
+	local firePos = SignalFireManager.getPosition()
+	local fireState = SignalFireManager.getState()
+	StalkerAI.Update(dt, firePos, fireState.radius)
+	RaidManager.Update(dt, firePos)
+
+	-- 5. Update world pickups (auto-collect when players are near)
+	PickupManager.Update(dt)
+
+	-- 6. Tick each player's stats
 	for _, player in Players:GetPlayers() do
 		-- Check if player is inside the dampening field
 		local inField = false
