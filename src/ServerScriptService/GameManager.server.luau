@@ -1,278 +1,137 @@
+--!strict
 -- GameManager.server.luau
--- Master game loop: manages sol cycle, game state, and coordinates all systems
+-- Master game loop: coordinates all server systems, manages the sol cycle,
+-- and runs the Heartbeat tick for stats/fire/lighting.
+--
+-- This is a Script (not a ModuleScript) so it auto-runs on the server.
+-- It requires all manager modules and wires them together.
+--
+-- Architecture:
+--   GameManager (this file) is the ONLY server Script.
+--   Everything else is a ModuleScript that exposes Init/Start/Update functions.
+--   This keeps the boot order explicit and avoids hidden require chains.
+--
+-- Place in: ServerScriptService (must be a .server.luau script)
 
 local Players = game:GetService("Players")
-local Lighting = game:GetService("Lighting")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Config = require(ReplicatedStorage.Shared.Config)
-local PlayerManager = require(ServerScriptService.PlayerManager)
-local SignalFireManager = require(ServerScriptService.SignalFireManager)
+-------------------------------------------------------------------------------
+-- Require all manager modules
+-------------------------------------------------------------------------------
 
--- Create RemoteEvents
-local Remotes = Instance.new("Folder")
-Remotes.Name = "Remotes"
-Remotes.Parent = ReplicatedStorage
+local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+local NetworkManager = require(ServerScriptService:WaitForChild("NetworkManager"))
+local DayNightCycle = require(ServerScriptService:WaitForChild("DayNightCycle"))
+local PlayerManager = require(ServerScriptService:WaitForChild("PlayerManager"))
+local SignalFireManager = require(ServerScriptService:WaitForChild("SignalFireManager"))
+local InventoryManager = require(ServerScriptService:WaitForChild("InventoryManager"))
 
-local function createRemote(name: string, className: string): Instance
-	local remote = Instance.new(className)
-	remote.Name = name
-	remote.Parent = Remotes
-	return remote
-end
-
--- Events: Server → Client
-local SolUpdated = createRemote("SolUpdated", "RemoteEvent")
-local TimeUpdated = createRemote("TimeUpdated", "RemoteEvent")
-local StatsUpdated = createRemote("StatsUpdated", "RemoteEvent")
-local InventoryUpdated = createRemote("InventoryUpdated", "RemoteEvent")
-local SignalFireUpdated = createRemote("SignalFireUpdated", "RemoteEvent")
-local NotifyClient = createRemote("NotifyClient", "RemoteEvent")
-
--- Events: Client → Server
-local AddFuel = createRemote("AddFuel", "RemoteEvent")
-local GatherResource = createRemote("GatherResource", "RemoteEvent")
-local CraftItem = createRemote("CraftItem", "RemoteEvent")
-local EatFood = createRemote("EatFood", "RemoteEvent")
-local DropItem = createRemote("DropItem", "RemoteEvent")
-
+-------------------------------------------------------------------------------
 -- Game state
-local gameState = {
-	currentSol = 1,
-	timeInCycle = 0,       -- seconds into current cycle
-	isNight = false,
-	running = false,
-}
+-------------------------------------------------------------------------------
 
--- Lighting presets
-local DAY_SETTINGS = {
-	ClockTime = 12,
-	Brightness = 2,
-	Ambient = Color3.fromRGB(135, 135, 128),
-	OutdoorAmbient = Color3.fromRGB(128, 128, 128),
-	FogEnd = 1000,
-	FogColor = Color3.fromRGB(192, 192, 192),
-}
+local gameRunning: boolean = false
 
-local NIGHT_SETTINGS = {
-	ClockTime = 0.5,
-	Brightness = 0,
-	Ambient = Color3.fromRGB(20, 15, 35),          -- slight purple alien tint
-	OutdoorAmbient = Color3.fromRGB(15, 10, 30),
-	FogEnd = 200,
-	FogColor = Color3.fromRGB(10, 8, 20),
-}
+-------------------------------------------------------------------------------
+-- DayNightCycle callbacks
+-------------------------------------------------------------------------------
 
-local function lerp(a: number, b: number, t: number): number
-	return a + (b - a) * t
-end
-
-local function lerpColor(a: Color3, b: Color3, t: number): Color3
-	return Color3.new(lerp(a.R, b.R, t), lerp(a.G, b.G, t), lerp(a.B, b.B, t))
-end
-
-local function updateLighting(timeInCycle: number)
-	local dayLen = Config.DAY_LENGTH
-	local nightLen = Config.NIGHT_LENGTH
-	local totalLen = Config.CYCLE_LENGTH
-
-	local isNight = timeInCycle >= dayLen
-	local t: number
-
-	if not isNight then
-		-- Daytime: map to ClockTime 6 → 18
-		local dayProgress = timeInCycle / dayLen
-		local clockTime = lerp(Config.DAWN_HOUR, Config.DUSK_HOUR, dayProgress)
-		Lighting.ClockTime = clockTime
-
-		-- Transition zones: dawn (first 10%) and dusk (last 10%)
-		if dayProgress < 0.1 then
-			t = dayProgress / 0.1 -- 0→1 during dawn
-			Lighting.Brightness = lerp(NIGHT_SETTINGS.Brightness, DAY_SETTINGS.Brightness, t)
-			Lighting.Ambient = lerpColor(NIGHT_SETTINGS.Ambient, DAY_SETTINGS.Ambient, t)
-			Lighting.OutdoorAmbient = lerpColor(NIGHT_SETTINGS.OutdoorAmbient, DAY_SETTINGS.OutdoorAmbient, t)
-			Lighting.FogEnd = lerp(NIGHT_SETTINGS.FogEnd, DAY_SETTINGS.FogEnd, t)
-			Lighting.FogColor = lerpColor(NIGHT_SETTINGS.FogColor, DAY_SETTINGS.FogColor, t)
-		elseif dayProgress > 0.9 then
-			t = (dayProgress - 0.9) / 0.1 -- 0→1 during dusk
-			Lighting.Brightness = lerp(DAY_SETTINGS.Brightness, NIGHT_SETTINGS.Brightness, t)
-			Lighting.Ambient = lerpColor(DAY_SETTINGS.Ambient, NIGHT_SETTINGS.Ambient, t)
-			Lighting.OutdoorAmbient = lerpColor(DAY_SETTINGS.OutdoorAmbient, NIGHT_SETTINGS.OutdoorAmbient, t)
-			Lighting.FogEnd = lerp(DAY_SETTINGS.FogEnd, NIGHT_SETTINGS.FogEnd, t)
-			Lighting.FogColor = lerpColor(DAY_SETTINGS.FogColor, NIGHT_SETTINGS.FogColor, t)
-		else
-			Lighting.Brightness = DAY_SETTINGS.Brightness
-			Lighting.Ambient = DAY_SETTINGS.Ambient
-			Lighting.OutdoorAmbient = DAY_SETTINGS.OutdoorAmbient
-			Lighting.FogEnd = DAY_SETTINGS.FogEnd
-			Lighting.FogColor = DAY_SETTINGS.FogColor
-		end
-	else
-		-- Nighttime: ClockTime 18 → 6 (through midnight)
-		local nightProgress = (timeInCycle - dayLen) / nightLen
-		local clockTime = Config.DUSK_HOUR + nightProgress * 12
-		if clockTime >= 24 then
-			clockTime = clockTime - 24
-		end
-		Lighting.ClockTime = clockTime
-
-		Lighting.Brightness = NIGHT_SETTINGS.Brightness
-		Lighting.Ambient = NIGHT_SETTINGS.Ambient
-		Lighting.OutdoorAmbient = NIGHT_SETTINGS.OutdoorAmbient
-		Lighting.FogEnd = NIGHT_SETTINGS.FogEnd
-		Lighting.FogColor = NIGHT_SETTINGS.FogColor
-	end
-
-	return isNight
-end
-
--- Main game loop
-local function gameLoop(dt: number)
-	if not gameState.running then return end
-
-	gameState.timeInCycle += dt
-
-	-- Check for cycle completion (new sol)
-	if gameState.timeInCycle >= Config.CYCLE_LENGTH then
-		gameState.timeInCycle -= Config.CYCLE_LENGTH
-		gameState.currentSol += 1
-
-		if gameState.currentSol > Config.MAX_SOL then
-			-- Victory!
-			NotifyClient:FireAllClients("Victory", "You survived all " .. Config.MAX_SOL .. " sols!")
-			gameState.running = false
-			return
-		end
-
-		SolUpdated:FireAllClients(gameState.currentSol)
-	end
-
-	-- Update lighting and determine day/night
-	local wasNight = gameState.isNight
-	gameState.isNight = updateLighting(gameState.timeInCycle)
-
-	-- Broadcast night transition
-	if gameState.isNight and not wasNight then
-		TimeUpdated:FireAllClients("Night", gameState.currentSol)
-	elseif not gameState.isNight and wasNight then
-		TimeUpdated:FireAllClients("Day", gameState.currentSol)
-	end
-
-	-- Update Signal Fire
-	SignalFireManager.update(dt)
-	SignalFireUpdated:FireAllClients(SignalFireManager.getState())
-
-	-- Update all player stats
+DayNightCycle.OnSolChanged(function(sol: number)
+	-- Update all players' leaderstat
 	for _, player in Players:GetPlayers() do
-		local stats = PlayerManager.getStats(player)
-		if stats then
-			-- Hunger drain
-			stats.Hunger = math.max(0, stats.Hunger - Config.HUNGER_DRAIN_RATE * dt)
-
-			-- Oxygen drain (faster at night)
-			local o2Drain = gameState.isNight and Config.OXYGEN_DRAIN_NIGHT or Config.OXYGEN_DRAIN_DAY
-			stats.Oxygen = math.max(0, stats.Oxygen - o2Drain * dt)
-
-			-- Signal Fire regen
-			local character = player.Character
-			if character then
-				local rootPart = character:FindFirstChild("HumanoidRootPart")
-				if rootPart then
-					local inField = SignalFireManager.isInField(rootPart.Position)
-					if inField then
-						stats.Health = math.min(Config.MAX_HEALTH, stats.Health + Config.SIGNAL_FIRE_HEAL_RATE * dt)
-						stats.Oxygen = math.min(Config.MAX_OXYGEN, stats.Oxygen + Config.SIGNAL_FIRE_O2_REGEN * dt)
-					end
-				end
+		local leaderstats = player:FindFirstChild("leaderstats")
+		if leaderstats then
+			local solValue = leaderstats:FindFirstChild("Sol") :: IntValue?
+			if solValue then
+				solValue.Value = sol
 			end
-
-			-- Hunger damage
-			if stats.Hunger <= 0 then
-				stats.Health = math.max(0, stats.Health - Config.HUNGER_DAMAGE_RATE * dt)
-			end
-
-			-- O2 damage
-			if stats.Oxygen <= 0 then
-				stats.Health = math.max(0, stats.Health - Config.HUNGER_DAMAGE_RATE * dt)
-			end
-
-			-- Sync humanoid health
-			if character then
-				local humanoid = character:FindFirstChildOfClass("Humanoid")
-				if humanoid then
-					humanoid.Health = stats.Health
-				end
-			end
-
-			-- Death check
-			if stats.Health <= 0 then
-				PlayerManager.onPlayerDied(player)
-			end
-
-			-- Send stats to client
-			StatsUpdated:FireClient(player, stats)
 		end
 	end
-end
 
--- Handle client requests
-AddFuel.OnServerEvent:Connect(function(player, itemId: string)
+	NetworkManager.FireAllClients("SolUpdated", sol)
+
+	-- Victory check
+	if sol > Config.MAX_SOL then
+		NetworkManager.FireAllClients("Notify", "Victory", `You survived all {Config.MAX_SOL} sols!`)
+		gameRunning = false
+	end
+end)
+
+DayNightCycle.OnNightChanged(function(isNight: boolean)
+	local phase = if isNight then "Night" else "Day"
+	NetworkManager.FireAllClients("TimePhaseChanged", phase, DayNightCycle.GetSol())
+end)
+
+-------------------------------------------------------------------------------
+-- Network handlers for client -> server actions
+-- All validation happens here on the server.
+-------------------------------------------------------------------------------
+
+-- Add fuel to the Signal Fire
+NetworkManager.OnClientEvent("AddFuel", function(player: Player, itemId: any)
+	if typeof(itemId) ~= "string" then return end
+
 	local fuelValue = Config.FUEL_VALUES[itemId]
 	if not fuelValue then return end
 
-	local inventory = PlayerManager.getInventory(player)
-	if not inventory then return end
-
-	-- Check player has the item
-	local removed = PlayerManager.removeItem(player, itemId, 1)
-	if not removed then return end
+	if not PlayerManager.removeItem(player, itemId, 1) then return end
 
 	SignalFireManager.addFuel(fuelValue)
-	InventoryUpdated:FireClient(player, PlayerManager.getInventory(player))
+
+	-- Send updated inventory to the player
+	local inv = PlayerManager.getInventory(player)
+	if inv then
+		NetworkManager.FireClient(player, "InventoryUpdated", inv)
+	end
 end)
 
-EatFood.OnServerEvent:Connect(function(player, itemId: string)
+-- Eat food
+NetworkManager.OnClientEvent("EatFood", function(player: Player, itemId: any)
+	if typeof(itemId) ~= "string" then return end
+
 	local itemDef = Config.ITEMS[itemId]
 	if not itemDef or not itemDef.hungerRestore then return end
 
-	local removed = PlayerManager.removeItem(player, itemId, 1)
-	if not removed then return end
+	if not PlayerManager.removeItem(player, itemId, 1) then return end
 
-	local stats = PlayerManager.getStats(player)
-	if stats then
-		stats.Hunger = math.min(Config.MAX_HUNGER, stats.Hunger + itemDef.hungerRestore)
+	PlayerManager.feed(player, itemDef.hungerRestore)
+
+	local inv = PlayerManager.getInventory(player)
+	if inv then
+		NetworkManager.FireClient(player, "InventoryUpdated", inv)
 	end
-
-	InventoryUpdated:FireClient(player, PlayerManager.getInventory(player))
 end)
 
-GatherResource.OnServerEvent:Connect(function(player, targetId: string)
-	-- Validate the target exists in workspace
-	local target = workspace:FindFirstChild("Resources") and workspace.Resources:FindFirstChild(targetId)
-	if not target then return end
+-- Gather a resource (tree, rock, bush, debris)
+NetworkManager.OnClientEvent("GatherResource", function(player: Player, targetName: any)
+	if typeof(targetName) ~= "string" then return end
+
+	local resources = workspace:FindFirstChild("Resources")
+	local target = if resources then resources:FindFirstChild(targetName) else nil
+	if not target or not target:IsA("BasePart") then return end
 
 	local resourceType = target:GetAttribute("ResourceType")
 	if not resourceType then return end
 
-	-- Check distance
+	-- Distance check (server-authoritative anti-cheat)
 	local character = player.Character
 	if not character then return end
-	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	local rootPart = character:FindFirstChild("HumanoidRootPart") :: BasePart?
 	if not rootPart then return end
-	local distance = (rootPart.Position - target.Position).Magnitude
-	if distance > 15 then return end
+	if (rootPart.Position - target.Position).Magnitude > 15 then return end
 
-	-- Process hits
-	local hitsLeft = target:GetAttribute("HitsLeft")
+	-- Hit processing
+	local hitsLeft = target:GetAttribute("HitsLeft") :: number?
 	if not hitsLeft or hitsLeft <= 0 then return end
 
 	target:SetAttribute("HitsLeft", hitsLeft - 1)
 
 	if hitsLeft - 1 <= 0 then
-		-- Resource depleted — give drops and hide
-		local drops = {}
+		-- Resource depleted: give drops
+		local drops: { { item: string, count: number } } = {}
 		if resourceType == "Tree" then
 			drops = { { item = "Wood", count = Config.TREE_WOOD_DROP } }
 		elseif resourceType == "Rock" then
@@ -287,7 +146,7 @@ GatherResource.OnServerEvent:Connect(function(player, targetId: string)
 			PlayerManager.addItem(player, drop.item, drop.count)
 		end
 
-		-- Hide resource, respawn later
+		-- Hide and respawn
 		target.Transparency = 1
 		target.CanCollide = false
 		target:SetAttribute("Depleted", true)
@@ -307,35 +166,114 @@ GatherResource.OnServerEvent:Connect(function(player, targetId: string)
 			end
 		end)
 
-		InventoryUpdated:FireClient(player, PlayerManager.getInventory(player))
+		local inv = PlayerManager.getInventory(player)
+		if inv then
+			NetworkManager.FireClient(player, "InventoryUpdated", inv)
+		end
 	end
 end)
 
--- Player connections
-Players.PlayerAdded:Connect(function(player)
+-- Sprint toggle
+NetworkManager.OnClientEvent("SetSprinting", function(player: Player, sprinting: any)
+	if typeof(sprinting) ~= "boolean" then return end
+	-- Actual stamina drain happens in the Heartbeat tick via setSprint
+	-- Here we just record the intent
+	PlayerManager.setSprint(player, sprinting, 0)
+end)
+
+-- Client requests full stats (e.g. after reconnect)
+NetworkManager.OnClientInvoke("GetMyStats", function(player: Player)
+	return PlayerManager.getStats(player)
+end)
+
+-------------------------------------------------------------------------------
+-- Register InventoryManager network handlers (equip, unequip, use, drop)
+-------------------------------------------------------------------------------
+
+InventoryManager.RegisterNetworkHandlers()
+
+-------------------------------------------------------------------------------
+-- Player lifecycle
+-------------------------------------------------------------------------------
+
+Players.PlayerAdded:Connect(function(player: Player)
 	PlayerManager.initPlayer(player)
 
-	player.CharacterAdded:Connect(function(character)
+	player.CharacterAdded:Connect(function(character: Model)
 		PlayerManager.onCharacterAdded(player, character)
+
+		-- Watch for death
+		local humanoid = character:WaitForChild("Humanoid") :: Humanoid
+		humanoid.Died:Connect(function()
+			InventoryManager.OnCharacterDied(player)
+			PlayerManager.onPlayerDied(player)
+		end)
 	end)
 end)
 
-Players.PlayerRemoving:Connect(function(player)
+Players.PlayerRemoving:Connect(function(player: Player)
+	InventoryManager.OnPlayerRemoving(player)
 	PlayerManager.cleanupPlayer(player)
 end)
 
--- Initialize and start
+-- Handle players that joined before this script ran
+for _, player in Players:GetPlayers() do
+	task.spawn(function()
+		PlayerManager.initPlayer(player)
+	end)
+end
+
+-------------------------------------------------------------------------------
+-- Initialize systems
+-------------------------------------------------------------------------------
+
 SignalFireManager.init()
+DayNightCycle.Init()
 
-gameState.running = true
-gameState.timeInCycle = 0
-gameState.currentSol = 1
+-------------------------------------------------------------------------------
+-- Main Heartbeat loop
+-- This is the single place where per-frame logic runs on the server.
+-------------------------------------------------------------------------------
 
--- Set initial lighting
-updateLighting(0)
-SolUpdated:FireAllClients(1)
+gameRunning = true
 
--- Connect to heartbeat (server tick)
-RunService.Heartbeat:Connect(gameLoop)
+RunService.Heartbeat:Connect(function(dt: number)
+	if not gameRunning then return end
 
-print("[GameManager] Game started — Sol 1")
+	-- 1. Advance day/night cycle (updates Lighting.ClockTime, fires callbacks)
+	local isNight = DayNightCycle.Update(dt)
+
+	-- 2. Update Signal Fire (burn fuel, update visuals)
+	SignalFireManager.update(dt)
+
+	-- 3. Broadcast signal fire state (using unreliable for high-frequency updates)
+	NetworkManager.FireAllClientsUnreliable("SignalFireUpdated", SignalFireManager.getState())
+
+	-- 4. Tick each player's stats
+	for _, player in Players:GetPlayers() do
+		-- Check if player is inside the dampening field
+		local inField = false
+		local character = player.Character
+		if character then
+			local rootPart = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+			if rootPart then
+				inField = SignalFireManager.isInField(rootPart.Position)
+			end
+		end
+
+		-- Tick stats (hunger drain, O2 drain, regen, damage)
+		local justDied = PlayerManager.tickStats(player, dt, isNight, inField)
+
+		if justDied then
+			InventoryManager.OnCharacterDied(player)
+			PlayerManager.onPlayerDied(player)
+		end
+
+		-- Sprint handling (dt-based stamina drain)
+		if PlayerManager.isSprinting(player) then
+			PlayerManager.setSprint(player, true, dt)
+		end
+	end
+end)
+
+print("[GameManager] All systems initialized. Sol 1 begins.")

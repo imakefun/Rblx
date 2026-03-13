@@ -1,17 +1,22 @@
+--!strict
 -- MainHUD (client)
--- Manages all HUD elements: stat bars, sol counter, inventory hotbar, fuel gauge
+-- Manages all HUD elements: stat bars, sol counter, inventory hotbar, fuel gauge.
+--
+-- STAT READING PATTERN:
+--   Stats (Health, Hunger, Oxygen, Stamina) are replicated via Player ATTRIBUTES.
+--   The server calls player:SetAttribute("Health", value), and the client reads
+--   them with player:GetAttribute("Health"). To react to changes in real time,
+--   use player:GetAttributeChangedSignal("Health"):Connect(function() ... end).
+--
+--   For bulk/event data (inventory, notifications, sol changes), we use the
+--   NetworkClient module which routes through a single RemoteEvent.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterPlayerScripts = Players.LocalPlayer:WaitForChild("PlayerScripts")
 
 local player = Players.LocalPlayer
-local Remotes = ReplicatedStorage:WaitForChild("Remotes")
-local StatsUpdated = Remotes:WaitForChild("StatsUpdated")
-local SolUpdated = Remotes:WaitForChild("SolUpdated")
-local TimeUpdated = Remotes:WaitForChild("TimeUpdated")
-local InventoryUpdated = Remotes:WaitForChild("InventoryUpdated")
-local SignalFireUpdated = Remotes:WaitForChild("SignalFireUpdated")
-local NotifyClient = Remotes:WaitForChild("NotifyClient")
+local NetworkClient = require(StarterPlayerScripts:WaitForChild("NetworkClient"))
 
 -- Create the ScreenGui
 local screenGui = Instance.new("ScreenGui")
@@ -342,22 +347,53 @@ local function updateHotbar(inventory: { [string]: number })
 end
 
 ------------------------------------------------------------------------
--- EVENT CONNECTIONS
+-- STAT UPDATES VIA ATTRIBUTES
+-- The server sets attributes on the Player instance; they auto-replicate.
+-- We listen for changes with GetAttributeChangedSignal (no RemoteEvent needed).
 ------------------------------------------------------------------------
 
-StatsUpdated.OnClientEvent:Connect(function(stats)
-	updateStatBar(healthBar, stats.Health, 100)
-	updateStatBar(hungerBar, stats.Hunger, 100)
-	updateStatBar(oxygenBar, stats.Oxygen, 100)
-	updateStatBar(staminaBar, stats.Stamina, 100)
+local function readMaxStat(name: string): number
+	return (player:GetAttribute("Max" .. name) :: number?) or 100
+end
+
+local function refreshStat(statName: string, bar: { label: TextLabel, fill: Frame })
+	local value: number = (player:GetAttribute(statName) :: number?) or 0
+	local maxValue: number = readMaxStat(statName)
+	updateStatBar(bar, value, maxValue)
+end
+
+-- Wire up attribute change signals for each stat
+player:GetAttributeChangedSignal("Health"):Connect(function()
+	refreshStat("Health", healthBar)
+end)
+player:GetAttributeChangedSignal("Hunger"):Connect(function()
+	refreshStat("Hunger", hungerBar)
+end)
+player:GetAttributeChangedSignal("Oxygen"):Connect(function()
+	refreshStat("Oxygen", oxygenBar)
+end)
+player:GetAttributeChangedSignal("Stamina"):Connect(function()
+	refreshStat("Stamina", staminaBar)
 end)
 
-SolUpdated.OnClientEvent:Connect(function(sol: number)
+-- Read initial values (they may already be set by the time the HUD runs)
+refreshStat("Health", healthBar)
+refreshStat("Hunger", hungerBar)
+refreshStat("Oxygen", oxygenBar)
+refreshStat("Stamina", staminaBar)
+
+------------------------------------------------------------------------
+-- EVENT-BASED UPDATES VIA NetworkClient (single RemoteEvent, ID-routed)
+------------------------------------------------------------------------
+
+NetworkClient.OnServerEvent("SolUpdated", function(sol: any)
+	if typeof(sol) ~= "number" then return end
 	solLabel.Text = "SOL " .. sol
 	showNotification("Sol " .. sol, 4)
 end)
 
-TimeUpdated.OnClientEvent:Connect(function(phase: string, sol: number)
+NetworkClient.OnServerEvent("TimePhaseChanged", function(phase: any, _sol: any)
+	if typeof(phase) ~= "string" then return end
 	if phase == "Night" then
 		timeLabel.Text = "Night"
 		timeLabel.TextColor3 = Color3.fromRGB(150, 100, 200)
@@ -368,15 +404,17 @@ TimeUpdated.OnClientEvent:Connect(function(phase: string, sol: number)
 	end
 end)
 
-InventoryUpdated.OnClientEvent:Connect(function(inventory)
+NetworkClient.OnServerEvent("InventoryUpdated", function(inventory: any)
+	if typeof(inventory) ~= "table" then return end
 	updateHotbar(inventory)
 end)
 
-SignalFireUpdated.OnClientEvent:Connect(function(fireState)
+-- Signal fire uses unreliable remote (high-frequency, non-critical)
+NetworkClient.OnServerEventUnreliable("SignalFireUpdated", function(fireState: any)
+	if typeof(fireState) ~= "table" then return end
 	local pct = fireState.fuel / fireState.maxFuel
 	fuelFill.Size = UDim2.new(math.clamp(pct, 0, 1), 0, 1, 0)
 
-	-- Color shift: green → yellow → red based on fuel
 	if pct > 0.5 then
 		fuelFill.BackgroundColor3 = Color3.fromRGB(255, 170, 40)
 	elseif pct > 0.2 then
@@ -385,11 +423,29 @@ SignalFireUpdated.OnClientEvent:Connect(function(fireState)
 		fuelFill.BackgroundColor3 = Color3.fromRGB(255, 50, 30)
 	end
 
-	fuelTitle.Text = "Signal Fire (Lv " .. fireState.level .. ")"
+	fuelTitle.Text = `Signal Fire (Lv {fireState.level})`
 end)
 
-NotifyClient.OnClientEvent:Connect(function(notifType: string, message: string)
+NetworkClient.OnServerEvent("Notify", function(notifType: any, message: any)
+	if typeof(message) ~= "string" then return end
 	showNotification(message, 5)
+end)
+
+NetworkClient.OnServerEvent("ToolEquipped", function(itemId: any)
+	if typeof(itemId) ~= "string" then return end
+	showNotification(`Equipped: {itemId}`, 2)
+end)
+
+NetworkClient.OnServerEvent("ToolUnequipped", function()
+	showNotification("Unequipped tool", 2)
+end)
+
+-- Request initial inventory on startup
+task.spawn(function()
+	local inv = NetworkClient.InvokeServerAsync("GetInventory")
+	if inv then
+		updateHotbar(inv)
+	end
 end)
 
 print("[MainHUD] HUD initialized")

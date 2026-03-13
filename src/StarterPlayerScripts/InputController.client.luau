@@ -1,5 +1,7 @@
+--!strict
 -- InputController.client.luau
--- Handles player input: sprinting, resource gathering, fuel adding, eating
+-- Handles player input: sprinting, resource gathering, fuel adding, eating.
+-- Uses the NetworkClient module (single RemoteEvent) instead of individual remotes.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -7,12 +9,8 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
-local Remotes = ReplicatedStorage:WaitForChild("Remotes")
-local GatherResource = Remotes:WaitForChild("GatherResource")
-local AddFuel = Remotes:WaitForChild("AddFuel")
-local EatFood = Remotes:WaitForChild("EatFood")
-
 local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+local NetworkClient = require(script.Parent:WaitForChild("NetworkClient"))
 
 -- Sprint state
 local isSprinting = false
@@ -45,7 +43,7 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 				local fuelPriority = { "PlasmaCore", "BatteryCell", "Coal", "Wood" }
 				for _, fuelId in fuelPriority do
 					-- We'll try adding fuel — the server validates
-					AddFuel:FireServer(fuelId)
+					NetworkClient.FireServer("AddFuel", fuelId)
 					break
 				end
 				return
@@ -67,7 +65,7 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		end
 
 		if nearestTarget then
-			GatherResource:FireServer(nearestTarget.Name)
+			NetworkClient.FireServer("GatherResource", nearestTarget.Name)
 		end
 	end
 
@@ -76,7 +74,7 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		-- Eat best food available
 		local foodPriority = { "CookedMeat", "Berries", "RawMeat" }
 		for _, foodId in foodPriority do
-			EatFood:FireServer(foodId)
+			NetworkClient.FireServer("EatFood", foodId)
 			break
 		end
 	end
@@ -84,8 +82,14 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	-- Number keys for hotbar selection (1-8)
 	local keyNumber = tonumber(input.KeyCode.Name)
 	if keyNumber and keyNumber >= 1 and keyNumber <= 8 then
-		-- TODO: equip item from hotbar slot
+		-- TODO: map hotbar slots to item IDs, then equip
 		print("[Input] Selected hotbar slot", keyNumber)
+		-- Example: NetworkClient.FireServer("EquipTool", "MakeshiftAxe")
+	end
+
+	-- Q to unequip current tool
+	if input.KeyCode == Enum.KeyCode.Q then
+		NetworkClient.FireServer("UnequipTool")
 	end
 end)
 
@@ -95,12 +99,10 @@ UserInputService.InputEnded:Connect(function(input, gameProcessed)
 	end
 end)
 
--- Sprint handling: update server with sprint state
-local SprintUpdate = Remotes:FindFirstChild("SprintUpdate")
-if not SprintUpdate then
-	-- Create it if it doesn't exist yet (the server may create it)
-	-- For now, handle sprint locally via humanoid speed
-end
+-- Sprint handling: notify server of sprint state changes.
+-- The server is authoritative for stamina drain, but we also do client-side
+-- prediction for responsive feel.
+local lastSprintState = false
 
 RunService.Heartbeat:Connect(function(dt)
 	local character = player.Character
@@ -108,8 +110,16 @@ RunService.Heartbeat:Connect(function(dt)
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	if not humanoid then return end
 
-	-- Client-side sprint prediction (server is authoritative but this feels responsive)
-	if isSprinting and humanoid.MoveDirection.Magnitude > 0 then
+	local wantSprint = isSprinting and humanoid.MoveDirection.Magnitude > 0
+
+	-- Only fire the remote when the sprint state changes (not every frame)
+	if wantSprint ~= lastSprintState then
+		lastSprintState = wantSprint
+		NetworkClient.FireServer("SetSprinting", wantSprint)
+	end
+
+	-- Client-side prediction for instant responsiveness
+	if wantSprint then
 		humanoid.WalkSpeed = 16 * Config.SPRINT_SPEED_MULT
 	else
 		humanoid.WalkSpeed = 16
